@@ -62,6 +62,11 @@
         .result-section { margin-top: 20px; }
         .result-section h3 { margin-bottom: 8px; border-bottom: 2px solid #ddd; padding-bottom: 4px; }
         .formation { background: #fffde7; border-left: 4px solid #ffeb3b; padding: 8px 12px; margin-bottom: 8px; font-family: monospace; font-size: 14px;}
+
+        #timeout-banner {
+            background: #fff3cd; color: #856404; padding: 12px; border-radius: 8px; margin-bottom: 16px;
+            font-size: 14px; border: 1px solid #ffeeba; font-weight: bold; text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -97,12 +102,18 @@
 
     <!-- LOADING SCREEN -->
     <div id="loading-screen" class="hidden loading">
-        Calculating optimal combinations...<br>
-        <small>This may take a second.</small>
+        <div id="progress-text">Initializing search...</div>
+        <small style="color:#888; font-weight: normal; margin-top: 8px; display:block;">
+            Running exhaustive search for the absolute maximum card play.
+        </small>
+        <button class="btn-action" style="margin-top:15px; background-color:#d32f2f;" onclick="triggerCancel()">
+            Stop & Show Best Found So Far
+        </button>
     </div>
 
     <!-- RESULTS SCREEN -->
     <div id="result-screen" class="hidden">
+        <div id="timeout-banner" class="hidden"></div>
         <div class="result-section">
             <h3>Unused Hand Cards (<span id="unused-count"></span>)</h3>
             <div class="card-list" id="unused-list"></div>
@@ -121,9 +132,9 @@
 </div>
 
 <script>
-    // --- STATE ---
+    // --- 1. GLOBAL STATE ---
     let currentTab = 'table';
-    let selectedColor = 0; // 0=Red, 1=Blue, 2=Black, 3=Orange, 4=Joker
+    let selectedColor = 0;
     let tableCards = [];
     let handCards = [];
     let idCounter = 0;
@@ -131,9 +142,283 @@
     const COLORS = ["red", "blue", "black", "orange", "joker"];
     const COLOR_NAMES = ["RED", "BLUE", "BLACK", "ORANGE"];
 
-    // --- UI INITIALIZATION ---
+    // Safety fallback step counters
+    let partitionSteps = 0;
+    const MAX_PARTITION_STEPS = 20000;
+
+    // --- 2. MATH & SOLVER HELPERS ---
+
+    // Filters out completely unplayable cards to shrink search trees
+    function pruneHand(table, hand) {
+        let poolCounts = Array.from({length: 4}, () => new Array(14).fill(0));
+        let poolJokers = 0;
+
+        for (let t of table.concat(hand)) {
+            if (t.isJoker) poolJokers++;
+            else poolCounts[t.color][t.value]++;
+        }
+
+        let prunedHand = [];
+        let unplayableHand = [];
+
+        for (let t of hand) {
+            if (t.isJoker) {
+                prunedHand.push(t);
+                continue;
+            }
+
+            let canGroup = false;
+            let canRun = false;
+
+            // Group check (Same value, different colors)
+            let colorsOfVal = 0;
+            for (let c = 0; c < 4; c++) {
+                if (poolCounts[c][t.value] > 0) colorsOfVal++;
+            }
+            if (colorsOfVal + poolJokers >= 3) {
+                canGroup = true;
+            }
+
+            // Run check (Consecutive values, same color)
+            if (!canGroup) {
+                for (let start = Math.max(1, t.value - 2); start <= t.value; start++) {
+                    let end = start + 2;
+                    if (end > 13) continue;
+
+                    let missing = 0;
+                    for (let v = start; v <= end; v++) {
+                        if (poolCounts[t.color][v] === 0) {
+                            missing++;
+                        }
+                    }
+                    if (missing <= poolJokers) {
+                        canRun = true;
+                        break;
+                    }
+                }
+            }
+
+            if (canGroup || canRun) {
+                prunedHand.push(t);
+            } else {
+                unplayableHand.push(t);
+            }
+        }
+
+        return { prunedHand, unplayableHand };
+    }
+
+    // Standard ES5 Iterator Object (Universal browser compatibility, 0% memory overhead)
+    function createCombinationsIterator(array, k) {
+        const n = array.length;
+        if (k > n || k < 0) return { next: () => ({ done: true }) };
+        if (k === 0) {
+            let done = false;
+            return {
+                next: () => {
+                    if (!done) {
+                        done = true;
+                        return { value: [], done: false };
+                    }
+                    return { done: true };
+                }
+            };
+        }
+
+        let indices = Array.from({length: k}, (_, i) => i);
+        let first = true;
+
+        return {
+            next: () => {
+                if (first) {
+                    first = false;
+                    return { value: indices.map(i => array[i]), done: false };
+                }
+
+                let i = k - 1;
+                while (i >= 0 && indices[i] === i + n - k) i--;
+                if (i < 0) return { done: true };
+
+                indices[i]++;
+                for (let j = i + 1; j < k; j++) {
+                    indices[j] = indices[j - 1] + 1;
+                }
+                return { value: indices.map(i => array[i]), done: false };
+            }
+        };
+    }
+
+    function partition(counts, jokers) {
+        partitionSteps++;
+        if (partitionSteps > MAX_PARTITION_STEPS) {
+            return null; // Abort symmetry explosion immediately
+        }
+
+        let firstC = -1, firstV = -1, found = false;
+
+        for (let v = 1; v <= 13; v++) {
+            for (let c = 0; c < 4; c++) {
+                if (counts[c][v] > 0) {
+                    firstC = c; firstV = v; found = true; break;
+                }
+            }
+            if (found) break;
+        }
+
+        if (!found) {
+            let res = [];
+            if (jokers > 0) res.push(`Leftover Jokers: ${jokers} (can be attached to any set)`);
+            return res;
+        }
+
+        let v = firstV;
+        let c = firstC;
+
+        // BRANCH 1: Runs
+        for (let start = Math.max(1, v - jokers); start <= v; start++) {
+            for (let end = Math.max(start + 2, v); end <= 13; end++) {
+                let missing = 0;
+                let consumed = [];
+                for (let k = start; k <= end; k++) {
+                    if (k >= v && counts[c][k] > 0) consumed.push(k);
+                    else missing++;
+                }
+
+                if (missing <= jokers) {
+                    for (let k of consumed) counts[c][k]--;
+                    let res = partition(counts, jokers - missing);
+                    if (res !== null) {
+                        let str = `Run: ${COLOR_NAMES[c]} ${start} to ${end}` + (missing > 0 ? ` (used ${missing} Joker)` : "");
+                        return [str].concat(res);
+                    }
+                    for (let k of consumed) counts[c][k]++; // Backtrack
+                }
+            }
+        }
+
+        // BRANCH 2: Groups
+        let others = [0, 1, 2, 3].filter(x => x !== c);
+        let groupOptions = [
+            [c, ...others],
+            [c, others[0], others[1]],
+            [c, others[0], others[2]],
+            [c, others[1], others[2]]
+        ];
+
+        for (let g of groupOptions) {
+            let missing = 0;
+            let consumed = [];
+            for (let color of g) {
+                if (counts[color][v] > 0) consumed.push(color);
+                else missing++;
+            }
+            if (missing <= jokers) {
+                for (let color of consumed) counts[color][v]--;
+                let res = partition(counts, jokers - missing);
+                if (res !== null) {
+                    let colorsStr = g.map(x => COLOR_NAMES[x]).join(", ");
+                    let str = `Group: Number ${v} [${colorsStr}]` + (missing > 0 ? ` (used ${missing} Joker)` : "");
+                    return [str].concat(res);
+                }
+                for (let color of consumed) counts[color][v]++; // Backtrack
+            }
+        }
+
+        return null;
+    }
+
+    // --- 3. CORE ASYNC SOLVER ENGINE ---
+
+    async function solveRummikubAsync(table, hand, onProgress, onComplete) {
+        // Prune completely unplayable cards to shrink search trees
+        const { prunedHand, unplayableHand } = pruneHand(table, hand);
+
+        // Sort pruned hand DESCENDING. High-value point cards first
+        let sortedHand = [...prunedHand].sort((a, b) => {
+            if (a.isJoker !== b.isJoker) return a.isJoker ? -1 : 1;
+            return b.value - a.value;
+        });
+
+        let isCancelled = false;
+        window.cancelSearch = () => { isCancelled = true; };
+
+        let bestResult = null;
+
+        // Allocate a single static count matrix to eliminate Garbage Collection lag
+        const countsMatrix = Array.from({length: 4}, () => new Array(14).fill(0));
+
+        // Baseline Check: Verify if table itself is valid (our safety fallback)
+        for (let c = 0; c < 4; c++) countsMatrix[c].fill(0);
+        let tableJokers = 0;
+        for (let t of table) {
+            if (t.isJoker) tableJokers++;
+            else countsMatrix[t.color][t.value]++;
+        }
+
+        partitionSteps = 0; // Reset steps limit
+        let baselineFormations = partition(countsMatrix, tableJokers);
+        if (baselineFormations !== null) {
+            bestResult = { used: [], unused: hand, formations: baselineFormations };
+        }
+
+        // Search combinations from sortedHand.length down to 1 (Exhaustive Search)
+        for (let k = sortedHand.length; k >= 1; k--) {
+            if (isCancelled) {
+                onComplete(bestResult, false, true);
+                return;
+            }
+            onProgress(`Testing plays using ${k} of ${sortedHand.length} playable hand cards...`);
+
+            const iterator = createCombinationsIterator(sortedHand, k);
+            let checkCount = 0;
+
+            while (true) {
+                if (isCancelled) {
+                    onComplete(bestResult, false, true);
+                    return;
+                }
+
+                const { value: subset, done } = iterator.next();
+                if (done) break;
+
+                checkCount++;
+
+                // Pause execution every 10,000 checks to allow browser render loop to fire
+                if (checkCount % 10000 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+
+                let combined = table.concat(subset);
+
+                // Reset static matrix
+                for (let c = 0; c < 4; c++) countsMatrix[c].fill(0);
+                let jokers = 0;
+
+                for (let t of combined) {
+                    if (t.isJoker) jokers++;
+                    else countsMatrix[t.color][t.value]++;
+                }
+
+                partitionSteps = 0; // Reset steps limit for every combination test
+                let formations = partition(countsMatrix, jokers);
+                if (formations !== null) {
+                    let usedIds = new Set(subset.map(c => c.id));
+                    let unused = hand.filter(c => !usedIds.has(c.id));
+
+                    bestResult = { used: subset, unused: unused, formations: formations };
+                    onComplete(bestResult, false, false); // Found absolute max, exit immediately
+                    return;
+                }
+            }
+        }
+        onComplete(bestResult, false, false);
+    }
+
+    // --- 4. UI HANDLERS & NAVIGATION ---
+
     function init() {
         let grid = document.getElementById('number-grid');
+        grid.innerHTML = '';
         for (let i = 1; i <= 13; i++) {
             let btn = document.createElement('button');
             btn.className = 'btn-num';
@@ -158,7 +443,6 @@
         document.querySelectorAll('.btn-color').forEach((btn, idx) => {
             btn.classList.toggle('active', idx === c);
         });
-        // If joker, hide numbers and show big add button
         let grid = document.getElementById('number-grid');
         if (c === 4) {
             grid.innerHTML = `<button class="btn-action secondary" style="grid-column: span 5; margin-top:0;" onclick="addCard(0, true)">ADD JOKER</button>`;
@@ -217,171 +501,43 @@
         if (currentTab === 'table') {
             switchTab('hand');
         } else {
-            // Trigger calculation
             document.getElementById('input-screen').classList.add('hidden');
             document.getElementById('tabs').classList.add('hidden');
             document.getElementById('loading-screen').classList.remove('hidden');
 
-            // Allow UI to update before blocking thread
-            setTimeout(() => {
-                let result = solveRummikub(tableCards, handCards);
-                showResults(result);
-            }, 50);
+            // Start non-blocking asynchronous solver
+            solveRummikubAsync(
+                tableCards,
+                handCards,
+                (progressText) => {
+                    document.getElementById('progress-text').innerText = progressText;
+                },
+                (result, timedOut, cancelled) => {
+                    showResults(result, timedOut, cancelled);
+                }
+            );
         }
     }
 
-    // --- ALGORITHM LOGIC ---
-
-    function solveRummikub(table, hand) {
-        // Iterate from max hand size down to 0
-        for (let k = hand.length; k >= 0; k--) {
-            let subsets = generateDistinctSubsets(hand, k);
-
-            // Optimization: Sort subsets to prioritize playing high-value cards (minimizing penalty)
-            subsets.sort((a, b) => {
-                let scoreA = a.reduce((sum, c) => sum + (c.isJoker ? 30 : c.value), 0);
-                let scoreB = b.reduce((sum, c) => sum + (c.isJoker ? 30 : c.value), 0);
-                return scoreB - scoreA;
-            });
-
-            for (let subset of subsets) {
-                let combined = table.concat(subset);
-
-                // Build count matrix
-                let counts = Array.from({length: 4}, () => new Array(14).fill(0));
-                let jokers = 0;
-
-                for (let t of combined) {
-                    if (t.isJoker) jokers++;
-                    else counts[t.color][t.value]++;
-                }
-
-                let formations = partition(counts, jokers);
-
-                if (formations !== null) {
-                    // Find unused cards by comparing IDs
-                    let usedIds = new Set(subset.map(c => c.id));
-                    let unused = hand.filter(c => !usedIds.has(c.id));
-                    return { used: subset, unused: unused, formations: formations };
-                }
-            }
+    function triggerCancel() {
+        if (window.cancelSearch) {
+            window.cancelSearch();
         }
-        return null;
     }
 
-    function generateDistinctSubsets(hand, k) {
-        if (k === 0) return [[]];
-        if (k > hand.length) return [];
+    // --- 5. RESULT RENDERING ---
 
-        let sorted = [...hand].sort((a, b) => {
-            if (a.isJoker !== b.isJoker) return a.isJoker ? 1 : -1;
-            if (a.color !== b.color) return a.color - b.color;
-            return a.value - b.value;
-        });
-
-        let results = [];
-        let indices = Array.from({length: k}, (_, i) => i);
-        let n = sorted.length;
-
-        while (true) {
-            results.push(indices.map(i => sorted[i]));
-            let i = k - 1;
-            while (i >= 0 && indices[i] === i + n - k) i--;
-            if (i < 0) break;
-            indices[i]++;
-            for (let j = i + 1; j < k; j++) indices[j] = indices[j - 1] + 1;
-        }
-
-        // Deduplicate
-        let uniqueMap = new Map();
-        for (let sub of results) {
-            let key = sub.map(t => `${t.isJoker ? 'J' : t.color + '-' + t.value}`).join('|');
-            if (!uniqueMap.has(key)) uniqueMap.set(key, sub);
-        }
-        return Array.from(uniqueMap.values());
-    }
-
-    function partition(counts, jokers) {
-        let firstC = -1, firstV = -1, found = false;
-
-        // Find lexicographically first available tile
-        for (let v = 1; v <= 13; v++) {
-            for (let c = 0; c < 4; c++) {
-                if (counts[c][v] > 0) {
-                    firstC = c; firstV = v; found = true; break;
-                }
-            }
-            if (found) break;
-        }
-
-        // Base case: No regular tiles left
-        if (!found) {
-            let res = [];
-            if (jokers > 0) res.push(`Leftover Jokers: ${jokers} (can be attached to any set)`);
-            return res;
-        }
-
-        let v = firstV;
-        let c = firstC;
-
-        // BRANCH 1: Runs
-        for (let start = Math.max(1, v - jokers); start <= v; start++) {
-            for (let end = Math.max(start + 2, v); end <= 13; end++) {
-                let missing = 0;
-                let consumed = [];
-                for (let k = start; k <= end; k++) {
-                    if (k >= v && counts[c][k] > 0) consumed.push(k);
-                    else missing++;
-                }
-
-                if (missing <= jokers) {
-                    for (let k of consumed) counts[c][k]--;
-                    let res = partition(counts, jokers - missing);
-                    if (res !== null) {
-                        let str = `Run: ${COLOR_NAMES[c]} ${start} to ${end}` + (missing > 0 ? ` (used ${missing} Joker)` : "");
-                        return [str].concat(res);
-                    }
-                    for (let k of consumed) counts[c][k]++; // Backtrack
-                }
-            }
-        }
-
-        // BRANCH 2: Groups
-        let others = [0, 1, 2, 3].filter(x => x !== c);
-        let groupOptions = [
-            [c, ...others], // Size 4
-            [c, others[0], others[1]], // Size 3s...
-            [c, others[0], others[2]],
-            [c, others[1], others[2]]
-        ];
-
-        for (let g of groupOptions) {
-            let missing = 0;
-            let consumed = [];
-            for (let color of g) {
-                if (counts[color][v] > 0) consumed.push(color);
-                else missing++;
-            }
-            if (missing <= jokers) {
-                for (let color of consumed) counts[color][v]--;
-                let res = partition(counts, jokers - missing);
-                if (res !== null) {
-                    let colorsStr = g.map(x => COLOR_NAMES[x]).join(", ");
-                    let str = `Group: Number ${v} [${colorsStr}]` + (missing > 0 ? ` (used ${missing} Joker)` : "");
-                    return [str].concat(res);
-                }
-                for (let color of consumed) counts[color][v]++; // Backtrack
-            }
-        }
-
-        return null;
-    }
-
-    // --- RESULT RENDERING ---
-
-    function showResults(result) {
+    function showResults(result, timedOut, cancelled) {
         document.getElementById('loading-screen').classList.add('hidden');
         document.getElementById('result-screen').classList.remove('hidden');
+
+        let banner = document.getElementById('timeout-banner');
+        if (cancelled) {
+            banner.classList.remove('hidden');
+            banner.innerHTML = `⚠️ Search stopped by user. Displaying the best play found before cancelling.`;
+        } else {
+            banner.classList.add('hidden');
+        }
 
         if (!result) {
             document.getElementById('formations-list').innerHTML = `<div style="color:red; font-weight:bold;">No valid formations found! Ensure the table cards actually represent a valid Rummikub board.</div>`;
@@ -408,7 +564,7 @@
         document.getElementById('tabs').classList.remove('hidden');
     }
 
-    // Start App
+    // Initialize UI on page load
     init();
 </script>
 </body>
