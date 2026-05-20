@@ -1,7 +1,7 @@
 A html/java app that automatically creates pairs with tiles from your hand and table.
 
 # Installation:
-Download the html file and open it in your preferred browser. Firefox has been tested and works.
+Unlike other solvers this does not require you to install anything just download the html file and open it in your preferred browser. Firefox has been tested and works.
 
 # Usage:
 ## It's very simple but here you go
