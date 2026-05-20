@@ -1,4 +1,4 @@
-A html/java app that automatically creates pairs with tiles from your hand and table.
+A html/java app that automatically creates pairs with tiles from your hand and table to remove the most tiles from your hand.
 
 # Installation:
 Unlike other solvers this does not require you to install anything just download the html file and open it in your preferred browser. Firefox has been tested and works.
