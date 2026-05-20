@@ -1,10 +1,10 @@
 A html/java app that automatically creates pairs with tiles from your hand and table.
 
-#Installation:
+# Installation:
 Download the html file and open it in your preferred browser. Firefox has been tested and works.
 
-#Usage:
-#It's very simple but here you go
+# Usage:
+## It's very simple but here you go
 
 - The first page shows the tiles on the table. Click a color and a number to add it to the table.
 - The second page show the same for your hand instead.
@@ -12,5 +12,5 @@ Download the html file and open it in your preferred browser. Firefox has been t
 - It will show you what tiles it used form your hand and which it didnt use
 - the new table formation shows you how to assemble all tiles together. (This programm doesnt care for the state of the table before, so you might
   have to disassemble and reassemble the entire table to get rid of a few tiles)
-- >Run means make a straight with the specified color going from and to the specified number
-  >Group means make a pair of three or four with the specified number and color.
+- Run means make a straight with the specified color going from and to the specified number.
+  Group means make a pair of three or four with the specified number and color.
